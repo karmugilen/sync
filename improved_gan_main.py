@@ -116,7 +116,7 @@ class ImprovedGANSteganographyModel(nn.Module):
 
     def embed(self, cover, secret):
         """
-        Embed secret into cover to produce stego image
+        Embed secret into cover to produce stego image by generating it directly.
         cover: [B, 3, H, W] - normalized to [-1, 1]
         secret: [B, 3, H, W] - normalized to [-1, 1]
         returns: stego image [B, 3, H, W]
@@ -124,11 +124,9 @@ class ImprovedGANSteganographyModel(nn.Module):
         # Concatenate cover and secret
         combined = torch.cat([cover, secret], dim=1)
 
-        # Generate stego image
-        stego_diff = self.embed_net(combined)
-
-        # Add a larger perturbation to allow better information embedding while maintaining cover appearance
-        stego = cover + 0.2 * stego_diff  # Increased from 0.1 to 0.2
+        # The embedding network now generates the entire stego image directly.
+        # It learns to blend the secret into the cover pixels holistically.
+        stego = self.embed_net(combined)
 
         return stego
 
@@ -379,13 +377,13 @@ def calculate_lpips_loss_fn():
     return lpips.LPIPS(net='alex')  # Using AlexNet as the perceptual model
 
 
-def improved_gan_steganography_loss(cover, stego, secret, recovered_secret, discriminator, 
-                                  alpha_hid=1.0, alpha_rec=1.0, alpha_adv=0.02):
+def improved_gan_steganography_loss(cover, stego, secret, recovered_secret, discriminator, lpips_loss_fn,
+                                  alpha_hid=1.0, alpha_rec=1.0, alpha_adv=0.02, alpha_lpips=0.5):
     """
-    Improved GAN-enhanced loss function for steganography:
-    - Hiding loss: difference between cover and stego images (imperceptibility)
-    - Recovery loss: difference between original and recovered secret (recoverability)
-    - Adversarial loss: discriminator loss to improve imperceptibility
+    Improved GAN-enhanced loss function with LPIPS for improved perceptual quality.
+    - Hiding loss: L2 (MSE) difference between cover and stego.
+    - Recovery loss: A combination of L2 (MSE) and LPIPS loss.
+    - Adversarial loss: Discriminator loss to improve imperceptibility.
     """
     # Clamp images to valid range to prevent numerical issues
     cover = torch.clamp(cover, -1, 1)
@@ -397,15 +395,21 @@ def improved_gan_steganography_loss(cover, stego, secret, recovered_secret, disc
     hiding_loss = F.mse_loss(stego, cover)
 
     # Recovery loss: L2 loss between original secret and recovered secret
-    recovery_loss = F.mse_loss(recovered_secret, secret)
+    recovery_mse_loss = F.mse_loss(recovered_secret, secret)
+    
+    # Perceptual loss (LPIPS) for recovery
+    recovery_lpips_loss = lpips_loss_fn(recovered_secret, secret).mean() # .mean() is important
+
+    # Combine recovery losses
+    recovery_loss = alpha_rec * recovery_mse_loss + alpha_lpips * recovery_lpips_loss
 
     # Adversarial loss: encourage stego images to fool the discriminator
     # Discriminator should output ~1 for real images (covers) and ~0 for fake (stegos)
     disc_on_stego = discriminator(stego)
     adversarial_loss = F.binary_cross_entropy(disc_on_stego, torch.ones_like(disc_on_stego))
 
-    # Combined loss
-    total_loss = alpha_hid * hiding_loss + alpha_rec * recovery_loss + alpha_adv * adversarial_loss
+    # Combined generator loss
+    total_loss = alpha_hid * hiding_loss + recovery_loss + alpha_adv * adversarial_loss
 
     return total_loss, hiding_loss, recovery_loss, adversarial_loss
 
@@ -425,6 +429,7 @@ def train_improved_gan_steganography_model(generator, discriminator, dataset, nu
         alpha_hid = config['training']['alpha_hid']
         alpha_rec = config['training']['alpha_rec']
         alpha_adv = config['training']['alpha_adv']  # New parameter for adversarial loss
+        alpha_lpips = config['training'].get('alpha_lpips', 0.5) # Get LPIPS weight from config
         num_epochs = config['training']['num_epochs']
     else:
         batch_size = 2
@@ -432,6 +437,7 @@ def train_improved_gan_steganography_model(generator, discriminator, dataset, nu
         alpha_hid = 1.0
         alpha_rec = 1.0
         alpha_adv = 0.02  # Weight for adversarial loss
+        alpha_lpips = 0.5 # Default LPIPS weight
 
     # Check for GPU availability
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -440,6 +446,9 @@ def train_improved_gan_steganography_model(generator, discriminator, dataset, nu
         print(f"CUDA device: {torch.cuda.get_device_name(0)}")
         generator = generator.to(device)
         discriminator = discriminator.to(device)
+
+    # Initialize LPIPS loss function for training
+    lpips_loss_fn = lpips.LPIPS(net='alex').to(device)
 
     # Create dataloader with more workers and pin_memory for better performance
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
@@ -467,7 +476,7 @@ def train_improved_gan_steganography_model(generator, discriminator, dataset, nu
     print(f"Discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
     print(f"Training on {len(dataset)} images for {num_epochs} epochs")
     print(f"Batch size: {batch_size}, Learning rate: {learning_rate}")
-    print(f"Loss weights - Hiding: {alpha_hid}, Recovery: {alpha_rec}, Adversarial: {alpha_adv}")
+    print(f"Loss weights - Hiding: {alpha_hid}, Recovery: {alpha_rec}, Adversarial: {alpha_adv}, LPIPS: {alpha_lpips}")
 
     # Initialize lists to store metrics for plotting
     train_losses = []
@@ -519,8 +528,8 @@ def train_improved_gan_steganography_model(generator, discriminator, dataset, nu
 
                 # Compute generator loss (includes adversarial component)
                 gen_loss, hiding_loss, recovery_loss, adv_loss = improved_gan_steganography_loss(
-                    cover_tensor, stego_output, secret_tensor, recovered_secret, discriminator,
-                    alpha_hid, alpha_rec, alpha_adv
+                    cover_tensor, stego_output, secret_tensor, recovered_secret, discriminator, lpips_loss_fn,
+                    alpha_hid, alpha_rec, alpha_adv, alpha_lpips
                 )
 
                 # Check for NaN/Inf values and skip the batch if problematic
@@ -656,7 +665,7 @@ def train_improved_gan_steganography_model(generator, discriminator, dataset, nu
                         # Compute validation generator loss
                         val_gen_loss, val_hiding_loss, val_recovery_loss, val_adv_loss = improved_gan_steganography_loss(
                             val_cover_tensor, val_stego_output, val_secret_tensor, val_recovered_secret, 
-                            discriminator, alpha_hid, alpha_rec, alpha_adv
+                            discriminator, lpips_loss_fn, alpha_hid, alpha_rec, alpha_adv, alpha_lpips
                         )
 
                         # Compute validation discriminator loss
@@ -1035,6 +1044,7 @@ def main(config_path="config.json"):
     alpha_hid = config['training']['alpha_hid']
     alpha_rec = config['training']['alpha_rec'] 
     alpha_adv = config['training'].get('alpha_adv', 0.02)  # New parameter for adversarial loss
+    alpha_lpips = config['training'].get('alpha_lpips', 0.5)  # New parameter for LPIPS loss
 
     # Load dataset
     possible_dirs = [config['data']['image_dir'], "dataset", "images", "./"]
@@ -1057,7 +1067,7 @@ def main(config_path="config.json"):
 
     print(f"Loaded {len(dataset)} images from {image_dir}")
     print(f"Training for {num_epochs} epochs with image size {img_size}x{img_size}")
-    print(f"Loss weights - Hiding: {alpha_hid}, Recovery: {alpha_rec}, Adversarial: {alpha_adv}")
+    print(f"Loss weights - Hiding: {alpha_hid}, Recovery: {alpha_rec}, Adversarial: {alpha_adv}, LPIPS: {alpha_lpips}")
 
     # Split dataset into train, validation, and test
     train_size = int(config['data']['train_ratio'] * len(dataset))
